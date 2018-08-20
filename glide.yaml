@@ -1,0 +1,11 @@
+package: bitcoinWatcher
+import:
+- package: github.com/btcsuite/btcd
+  subpackages:
+  - rpcclient
+- package: github.com/olivere/elastic
+  version: ^6.0.0
+- package: github.com/go-sql-driver/mysql
+- package: github.com/inconshreveable/log15
+- package: github.com/cpacia/bchutil
+  version: 12e86f41eb040d3b85b5d8e3a3a4bed035517c52
