@@ -194,3 +194,11 @@ func (b *BitCoinClient) EstimateFee(numBlocks int64) (int64, error) {
 	return int64(fee * 1E8), err
 
 }
+
+func (b *BitCoinClient) ImportAddress(address string) error {
+	return b.rpcClient.ImportAddressRescan(address, false)
+}
+
+func (b *BitCoinClient) ListUnspent(address []btcutil.Address) ([]btcjson.ListUnspentResult, error) {
+	return b.rpcClient.ListUnspentMinMaxAddresses(0, 999999, address)
+}

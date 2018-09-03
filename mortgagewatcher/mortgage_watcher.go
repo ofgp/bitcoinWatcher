@@ -12,9 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcutil"
+
 	"github.com/ofgp/bitcoinWatcher/coinmanager"
 	"github.com/ofgp/bitcoinWatcher/dbop"
 	"github.com/ofgp/bitcoinWatcher/util"
+	"github.com/shopspring/decimal"
 
 	"github.com/btcsuite/btcd/btcjson"
 
@@ -41,46 +44,6 @@ func init() {
 
 }
 
-//UtxoCacheMap utxoCache缓存
-type UtxoCacheMap struct {
-	sync.Mutex
-	CacheUtxo map[string]*coinmanager.UtxoInfo
-}
-
-//NewUtxoCacheMap 新建一个utxoCache
-func NewUtxoCacheMap() *UtxoCacheMap {
-	return &UtxoCacheMap{
-		CacheUtxo: make(map[string]*coinmanager.UtxoInfo),
-	}
-}
-
-//Get 从缓存中查询一个utxo信息，没有则返回nil
-func (ucm *UtxoCacheMap) Get(id string) *coinmanager.UtxoInfo {
-	ucm.Lock()
-	defer ucm.Unlock()
-
-	if _, ok := ucm.CacheUtxo[id]; ok {
-		return ucm.CacheUtxo[id]
-	}
-	return nil
-}
-
-//Set 储存一个utxo信息
-func (ucm *UtxoCacheMap) Set(id string, utxo *coinmanager.UtxoInfo) {
-	ucm.Lock()
-	defer ucm.Unlock()
-
-	ucm.CacheUtxo[id] = utxo
-
-}
-
-//Delete 从缓存中删除一个utxo
-func (ucm *UtxoCacheMap) Delete(id string) {
-	ucm.Lock()
-	defer ucm.Unlock()
-	delete(ucm.CacheUtxo, id)
-}
-
 //MortgageWatcher 抵押交易监听类
 type MortgageWatcher struct {
 	sync.Mutex
@@ -90,13 +53,16 @@ type MortgageWatcher struct {
 	mortgageTxChan    chan *SubTransaction
 	federationAddress string
 	redeemScript      []byte
-	faUtxoInfo        sync.Map
 	levelDb           *dbop.LDBDatabase
-	utxoMonitorCount  map[string]int
-	levelDbUtxoPreFix string
-	levelDbTxPreFix   string
+	utxoMonitorCount  sync.Map
 	federationMap     sync.Map
+	addrList          []btcutil.Address
 	timeout           int
+	confirmNum        int64
+
+	levelDbTxMappingPreFix string
+	levelDbTxPreFix        string
+	levelDbUtxoPreFix      string
 }
 
 func openLevelDB(coinType string) (*dbop.LDBDatabase, error) {
@@ -168,30 +134,33 @@ func NewMortgageWatcher(coinType string, confirmHeight int64, federationAddress 
 		mortgageTxChan:    make(chan *SubTransaction, 100),
 		federationAddress: federationAddress,
 		redeemScript:      redeemScript,
-		utxoMonitorCount:  make(map[string]int),
 		timeout:           timeout,
 	}
 
+	switch coinType {
+	case "btc":
+		mw.confirmNum = int64(viper.GetInt64("BTC.confirm_block_num"))
+	case "bch":
+		mw.confirmNum = int64(viper.GetInt64("BCH.confirm_block_num"))
+	}
+
 	mw.federationMap.Store(federationAddress, redeemScript)
+	addr, err := coinmanager.DecodeAddress(federationAddress, coinType)
+	if err != nil {
+		log.Warn("decode address failed", "err", err.Error())
+		return nil, err
+	}
+	mw.addrList = append(mw.addrList, addr)
+
+	err = mw.bwClient.GetBitCoinClient().ImportAddress(federationAddress)
+	if err != nil {
+		log.Warn("Import address failed", "err", err.Error(), "coinType", coinType)
+		return nil, err
+	}
 
 	mw.levelDbUtxoPreFix = strings.Join([]string{coinType, "utxo"}, "_")
-	mw.levelDbTxPreFix = strings.Join([]string{coinType, "hash_mapping"}, "_")
-
-	iter := levelDb.NewIteratorWithPrefix([]byte(mw.levelDbUtxoPreFix))
-	for iter.Next() {
-		utxo := &coinmanager.UtxoInfo{}
-		err := json.Unmarshal(iter.Value(), utxo)
-		if err != nil {
-			log.Warn("Unmarshal UTXO FROM LEVELDB ERR", "err", err.Error(), "coinType", coinType)
-			continue
-		}
-
-		if utxo.SpendType == 3 {
-			continue
-		}
-		mw.faUtxoInfo.Store(string(iter.Key())[9:], utxo)
-		//log.Debug("utxo info", "id", string(iter.Key())[9:], "utxo", utxo, "coinType", coinType)
-	}
+	mw.levelDbTxPreFix = strings.Join([]string{coinType, "fa_tx"}, "_")
+	mw.levelDbTxMappingPreFix = strings.Join([]string{coinType, "hash_mapping"}, "_")
 
 	return &mw, err
 }
@@ -199,59 +168,21 @@ func NewMortgageWatcher(coinType string, confirmHeight int64, federationAddress 
 func (m *MortgageWatcher) utxoMonitor() {
 	go func() {
 		for {
-			m.faUtxoInfo.Range(func(k, v interface{}) bool {
+			m.utxoMonitorCount.Range(func(k, v interface{}) bool {
 				utxoID := k.(string)
-				utxoInfo := v.(*coinmanager.UtxoInfo)
-
-				if utxoInfo.SpendType == 4 {
-					if _, ok := m.utxoMonitorCount[utxoID]; !ok {
-						m.utxoMonitorCount[utxoID] = 0
-					}
-					m.utxoMonitorCount[utxoID]++
-
-					//utxo临时占用超时，状态改回未使用
-					if m.utxoMonitorCount[utxoID] >= m.timeout {
-						utxoInfo.SpendType = 1
-						m.storeUtxo(utxoID)
-						delete(m.utxoMonitorCount, utxoID)
-					}
-
+				count := v.(int)
+				count++
+				if count >= m.timeout {
+					m.utxoMonitorCount.Delete(utxoID)
 				} else {
-					if _, ok := m.utxoMonitorCount[utxoID]; ok {
-						delete(m.utxoMonitorCount, utxoID)
-					}
+					m.utxoMonitorCount.Store(utxoID, count)
 				}
-
 				return true
 			})
 
 			time.Sleep(time.Duration(1) * time.Second)
 		}
 	}()
-}
-
-func (m *MortgageWatcher) storeUtxo(utxoID string) bool {
-	t, ok := m.faUtxoInfo.Load(utxoID)
-	if ok {
-		utxoInfo := t.(*coinmanager.UtxoInfo)
-		data, err := json.Marshal(utxoInfo)
-		if err != nil {
-			log.Warn("Marshal utxo failed", "err", err.Error(), "coinType", m.coinType)
-			return false
-		}
-
-		key := strings.Join([]string{m.levelDbUtxoPreFix, utxoID}, "_")
-
-		retErr := m.levelDb.Put([]byte(key), []byte(data))
-		if retErr != nil {
-			log.Warn("Marshal utxo failed", "err", err.Error(), "coinType", m.coinType)
-			return false
-		}
-
-		return true
-	}
-
-	return false
 }
 
 //GetBlockNumber 获取当前已监听到的区块
@@ -264,31 +195,149 @@ func (m *MortgageWatcher) GetFederationAddress() string {
 	return m.federationAddress
 }
 
-//GetUnspentUtxo 获得指定地址未花费的utxo
-func (m *MortgageWatcher) GetUnspentUtxo(address string) []*coinmanager.UtxoInfo {
-	var retList []*coinmanager.UtxoInfo
-	var sum int64
+//checkIsFromFederation 检查交易是否是网关发出
+func (m *MortgageWatcher) checkIsFromFederation(txid string) bool {
+	txKey := strings.Join([]string{m.levelDbTxPreFix, txid}, "_")
 
-	m.faUtxoInfo.Range(func(k, v interface{}) bool {
-		utxoInfo := v.(*coinmanager.UtxoInfo)
-		if utxoInfo.SpendType == 1 && utxoInfo.Address == address {
-			retList = append(retList, utxoInfo)
-			sum += utxoInfo.Value
-		}
+	realHash, err := m.levelDb.Get([]byte(txKey))
+	if realHash != nil && err == nil {
 		return true
-	})
+	}
+	return false
+}
 
-	log.Debug("Unspent Utxo value", "sum", sum)
+//syncUtxoInfo 从全节点获取更新utxo进leveldb
+func (m *MortgageWatcher) syncUtxoInfo() {
+	go func() {
+		lastUtxoSnapShot := make(map[string]*coinmanager.UtxoInfo)
+		for {
+			tempUtxo := make(map[string]*coinmanager.UtxoInfo)
+			utxoList, err := m.bwClient.GetBitCoinClient().ListUnspent(m.addrList)
+			if err != nil {
+				log.Warn("listunspent failed")
+				continue
+			}
+
+			for _, utxo := range utxoList {
+				utxoID := strings.Join([]string{utxo.TxID, strconv.Itoa(int(utxo.Vout))}, "_")
+				value := decimal.NewFromFloat(utxo.Amount).Mul(decimal.NewFromFloat(1E8)).IntPart()
+				utxoInfo := &coinmanager.UtxoInfo{
+					Address:       utxo.Address,
+					Txid:          utxo.TxID,
+					Vout:          utxo.Vout,
+					Value:         value,
+					Confirmations: utxo.Confirmations,
+				}
+				tempUtxo[utxoID] = utxoInfo
+				if _, ok := lastUtxoSnapShot[utxoID]; ok {
+					continue
+				}
+
+				log.Debug("utxo info", "amount", utxo, "value", utxoInfo.Value)
+
+				data, err := json.Marshal(utxoInfo)
+				if err != nil {
+					log.Warn("Marshal utxo failed", "err", err.Error(), "coinType", m.coinType)
+					continue
+				}
+
+				key := strings.Join([]string{m.levelDbUtxoPreFix, utxoID}, "_")
+
+				retErr := m.levelDb.Put([]byte(key), []byte(data))
+				if retErr != nil {
+					log.Warn("Marshal utxo failed", "err", err.Error(), "coinType", m.coinType)
+					continue
+				}
+			}
+			lastUtxoSnapShot = tempUtxo
+			time.Sleep(time.Duration(1) * time.Second)
+		}
+	}()
+}
+
+//getUtxoInfo 从leveldb中获取utxo信息
+func (m *MortgageWatcher) GetUtxoInfoByID(utxoID string) *coinmanager.UtxoInfo {
+	Key := strings.Join([]string{m.levelDbUtxoPreFix, utxoID}, "_")
+
+	utxodata, err := m.levelDb.Get([]byte(Key))
+	if utxodata != nil && err == nil {
+		utxo := &coinmanager.UtxoInfo{}
+		err := json.Unmarshal(utxodata, utxo)
+		if err != nil {
+			log.Warn("Unmarshal UTXO FROM LEVELDB ERR", "err", err.Error(), "coinType", m.coinType)
+			return nil
+		}
+
+		return utxo
+	}
+	return nil
+}
+
+//GetUnspentUtxo 获得指定地址未花费的utxo
+func (m *MortgageWatcher) GetUnspentUtxo(address string) coinmanager.UtxoList {
+	var retList coinmanager.UtxoList
+
+	addr, err := coinmanager.DecodeAddress(address, m.coinType)
+	if err != nil {
+		return retList
+	}
+
+	utxoList, err := m.bwClient.GetBitCoinClient().ListUnspent([]btcutil.Address{addr})
+	if err != nil {
+		return retList
+	}
+
+	for _, utxo := range utxoList {
+		utxoID := strings.Join([]string{utxo.TxID, strconv.Itoa(int(utxo.Vout))}, "_")
+		//临时占用中
+		_, ok := m.utxoMonitorCount.Load(utxoID)
+		if ok {
+			continue
+		}
+
+		//utxo小于确认数并且不是网关发出
+		if utxo.Confirmations < m.confirmNum && !m.checkIsFromFederation(utxo.TxID) {
+			continue
+		}
+
+		value := decimal.NewFromFloat(utxo.Amount).Mul(decimal.NewFromFloat(1E8)).IntPart()
+		//value, _ := new(big.Float).Mul(new(big.Float).SetFloat64(utxo.Amount), new(big.Float).SetFloat64(1E8)).Int64()
+		utxoInfo := &coinmanager.UtxoInfo{
+			Address:       utxo.Address,
+			Txid:          utxo.TxID,
+			Vout:          utxo.Vout,
+			Value:         value,
+			Confirmations: utxo.Confirmations,
+		}
+		log.Debug("utxo info", "amount", utxo, "value", utxoInfo.Value)
+		retList = append(retList, utxoInfo)
+	}
+
 	return retList
 }
 
 //ChangeFederationAddress 修改多签地址
-func (m *MortgageWatcher) ChangeFederationAddress(federationAddress string, redeemScript []byte) {
+func (m *MortgageWatcher) ChangeFederationAddress(federationAddress string, redeemScript []byte) bool {
 	m.Lock()
 	defer m.Unlock()
 	m.federationAddress = federationAddress
 	m.redeemScript = redeemScript
 	m.federationMap.Store(federationAddress, redeemScript)
+	addr, err := coinmanager.DecodeAddress(federationAddress, m.coinType)
+	if err != nil {
+		log.Warn("decode address failed", "err", err.Error())
+		return false
+	}
+	m.addrList = append(m.addrList, addr)
+
+	err = m.bwClient.GetBitCoinClient().ImportAddress(federationAddress)
+	if err != nil {
+		log.Warn("Import address failed", "err", err.Error(), "coinType", m.coinType)
+		return false
+	}
+
+	return true
+
 }
 
 //TransferAsset 从指定地址迁移资产到新多签地址。
@@ -307,21 +356,19 @@ func (m *MortgageWatcher) TransferAsset(address string, sigNum int, NodeNum int)
 	count := 0
 	var coinSum int64
 	for _, selectCoin := range unspentUtxoList {
-		hash, err := chainhash.NewHashFromStr(selectCoin.VoutTxid)
+		hash, err := chainhash.NewHashFromStr(selectCoin.Txid)
 		if err != nil {
 			log.Warn("NEW_HASH_FAILED:", "err", err.Error(), "hash", hash, "coinType", m.coinType)
 			return nil
 		}
 
-		selectCoin.SpendType = 4
-		utxoID := strings.Join([]string{selectCoin.VoutTxid, strconv.Itoa(int(selectCoin.VoutIndex))}, "_")
+		utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
 		log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
-		m.storeUtxo(utxoID)
 
 		vin := wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{
 				Hash:  *hash,
-				Index: selectCoin.VoutIndex,
+				Index: selectCoin.Vout,
 			},
 		}
 
@@ -385,11 +432,10 @@ func (m *MortgageWatcher) GetTxChan() <-chan *SubTransaction {
 }
 
 //CreateCoinTx 创建提币交易数据
-//功能：根据提币地址和提币金额、矿工费，拉取联盟地址可用UTXO创建提币交易数据
+//功能：根据提币地址和提币金额，拉取联盟地址可用UTXO创建提币交易数据
 //输入： addrList： 提币地址与金额
-//		fee 矿工费
 //输出： 交易数据
-func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, fee int64, ScTxid string) (*wire.MsgTx, int) {
+func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, NodeNum int) (*wire.MsgTx, int) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -399,90 +445,93 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, fee int64, ScTxi
 		totalValue += addrInfo.Amount
 	}
 
-	//TODO: total_value是否要按一定比例收取手续费
+	//miner fee
+	feePerKB, err := m.bwClient.GetBitCoinClient().EstimateFee(1)
+	if err != nil {
+		log.Error("get fee/kb failed", "err", err.Error())
+		return nil, 1
+	}
+	if feePerKB <= 0 {
+		feePerKB = 1000
+	}
 
+	minFee := feePerKB
 	unspentUtxoList := m.GetUnspentUtxo(m.federationAddress)
 	log.Debug("utxolist", "len", len(unspentUtxoList))
 
-	selectCoinList, coinSum := coinmanager.CoinSelect(unspentUtxoList, totalValue+fee, m.scanConfirmHeight)
+	//tx create
+	tx := wire.NewMsgTx(2)
 
-	log.Debug("selectCoinList", "len", len(selectCoinList), "coinSum", coinSum)
+	for {
+		selectCoinList, coinSum := coinmanager.CoinSelect(unspentUtxoList, totalValue+minFee)
+		log.Debug("selectCoinList", "len", len(selectCoinList), "coinSum", coinSum)
 
-	if coinSum < totalValue+fee {
-		log.Warn("COIN NOT ENOUGH", "coinType", m.coinType)
-		return nil, 1
+		if coinSum < totalValue+minFee {
+			log.Warn("COIN NOT ENOUGH", "coinType", m.coinType)
+			return nil, 1
+		}
+
+		//估算交易大小
+		voutLen := (len(addrList) + 1) * 40
+		vinLen := len(selectCoinList) * (40 + 10 + 73*sigNum + 66*NodeNum)
+		txLen := 8 + wire.VarIntSerializeSize(uint64(len(selectCoinList))) + wire.VarIntSerializeSize(uint64(len(addrList)+1)) + voutLen + vinLen
+		minFee = feePerKB * int64(txLen) / 1000
+		if minFee < 1000 {
+			minFee = 1000
+		}
+
+		if coinSum >= totalValue+minFee {
+			//new vin
+			for _, selectCoin := range selectCoinList {
+				hash, err := chainhash.NewHashFromStr(selectCoin.Txid)
+				if err != nil {
+					log.Warn("NEW_HASH_FAILED:", "err", err.Error(), "hash", hash, "coinType", m.coinType)
+					return nil, 100
+				}
+
+				utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
+				log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
+
+				vin := wire.TxIn{
+					PreviousOutPoint: wire.OutPoint{
+						Hash:  *hash,
+						Index: selectCoin.Vout,
+					},
+				}
+				tx.AddTxIn(&vin)
+			}
+
+			//找零
+			if coinSum-totalValue-minFee > 546 {
+				smallChange := AddressInfo{
+					Address: m.federationAddress,
+					Amount:  coinSum - totalValue - minFee,
+				}
+				addrList = append(addrList, &smallChange)
+			}
+
+			for _, addrInfo := range addrList {
+				decodeAddr, err := coinmanager.DecodeAddress(addrInfo.Address, m.coinType)
+				if err != nil {
+					log.Warn("DecodeAddress failed", "err", err.Error(), "coinType", m.coinType)
+					return nil, 2
+				}
+				pkScript, err := bchutil.PayToAddrScript(decodeAddr)
+				if err != nil {
+					log.Warn("PayToAddrScript failed", "err", err.Error(), "coinType", m.coinType)
+					return nil, 2
+				}
+
+				vout := wire.TxOut{
+					Value:    addrInfo.Amount,
+					PkScript: pkScript,
+				}
+				tx.AddTxOut(&vout)
+			}
+
+			return tx, 0
+		}
 	}
-
-	//TODO: miner fee
-	if coinSum > totalValue+fee {
-		smallChange := AddressInfo{
-			Address: m.federationAddress,
-			Amount:  coinSum - totalValue - fee,
-		}
-		addrList = append(addrList, &smallChange)
-	}
-
-	tx := wire.NewMsgTx(1)
-
-	//new vin
-	for _, selectCoin := range selectCoinList {
-		hash, err := chainhash.NewHashFromStr(selectCoin.VoutTxid)
-		if err != nil {
-			log.Warn("NEW_HASH_FAILED:", "err", err.Error(), "hash", hash, "coinType", m.coinType)
-			return nil, 100
-		}
-
-		selectCoin.SpendType = 4
-		utxoID := strings.Join([]string{selectCoin.VoutTxid, strconv.Itoa(int(selectCoin.VoutIndex))}, "_")
-		log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
-		m.storeUtxo(utxoID)
-
-		vin := wire.TxIn{
-			PreviousOutPoint: wire.OutPoint{
-				Hash:  *hash,
-				Index: selectCoin.VoutIndex,
-			},
-		}
-
-		tx.AddTxIn(&vin)
-
-	}
-
-	//new vout
-	for _, addrInfo := range addrList {
-		decodeAddr, err := coinmanager.DecodeAddress(addrInfo.Address, m.coinType)
-		if err != nil {
-			log.Warn("DecodeAddress failed", "err", err.Error(), "coinType", m.coinType)
-			return nil, 2
-		}
-		pkScript, err := bchutil.PayToAddrScript(decodeAddr)
-		if err != nil {
-			log.Warn("PayToAddrScript failed", "err", err.Error(), "coinType", m.coinType)
-			return nil, 2
-		}
-
-		vout := wire.TxOut{
-			Value:    addrInfo.Amount,
-			PkScript: pkScript,
-		}
-		tx.AddTxOut(&vout)
-	}
-
-	if ScTxid != "" {
-		pkScript1, err := txscript.NullDataScript([]byte(ScTxid))
-		if err != nil {
-			return nil, 2
-		}
-
-		vout1 := wire.TxOut{
-			Value:    0,
-			PkScript: pkScript1,
-		}
-		tx.AddTxOut(&vout1)
-	}
-
-	return tx, 0
-
 }
 
 //SignTx 对交易数据签名，返回交易签名
@@ -492,23 +541,16 @@ func (m *MortgageWatcher) SignTx(tx *wire.MsgTx, nodePubKeyHash string) ([][]byt
 
 	for i, vin := range tx.TxIn {
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-		t, ok := m.faUtxoInfo.Load(utxoID)
-		if ok {
-			utxoInfo := t.(*coinmanager.UtxoInfo)
+		utxoInfo := m.GetUtxoInfoByID(utxoID)
+
+		if utxoInfo != nil {
 			rs, rsok := m.federationMap.Load(utxoInfo.Address)
 			if rsok {
-				if utxoInfo.SpendType == 2 {
-					log.Warn("Utxo using", "utxoID", utxoID)
-					return sigs, 4
-				}
-
-				utxoInfo.SpendType = 4
-				m.storeUtxo(utxoID)
-
 				redeemScript := rs.([]byte)
 				sig, err := coinmanager.RawTxInSignature(tx, i, redeemScript, txscript.SigHashAll,
 					utxoInfo.Value, m.coinType, nodePubKeyHash,
 				)
+				log.Debug("utxoInfo", "utxoInfo", utxoInfo.Value)
 				if err != nil {
 					return sigs, 3
 				}
@@ -532,13 +574,12 @@ func (m *MortgageWatcher) MergeSignTx(tx *wire.MsgTx, sigsList [][][]byte) bool 
 
 	for i, vin := range tx.TxIn {
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-		t, ok := m.faUtxoInfo.Load(utxoID)
-		if !ok {
+		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		if utxoInfo == nil {
 			log.Warn("【MergeSignTx】CAN'T FIND UTXO", "utxo", utxoID)
 			return false
 		}
 
-		utxoInfo := t.(*coinmanager.UtxoInfo)
 		rs, rsok := m.federationMap.Load(utxoInfo.Address)
 		if !rsok {
 			log.Warn("【MergeSignTx】CAN'T FIND Address", "Address", utxoInfo.Address)
@@ -593,9 +634,8 @@ func (m *MortgageWatcher) VerifySign(tx *wire.MsgTx, sigs [][]byte, pubKey []byt
 		var hash []byte
 
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-		t, ok := m.faUtxoInfo.Load(utxoID)
-		if ok {
-			utxoInfo := t.(*coinmanager.UtxoInfo)
+		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		if utxoInfo != nil {
 			rs, rsok := m.federationMap.Load(utxoInfo.Address)
 			if !rsok {
 				log.Warn("【VerifySign】CAN'T FIND Address", "Address", utxoInfo.Address)
@@ -642,55 +682,10 @@ func (m *MortgageWatcher) SendTx(tx *wire.MsgTx) (string, *btcjson.RPCError) {
 	return hash.String(), nil
 }
 
-func (m *MortgageWatcher) TxTest() {
-	addrList := []*AddressInfo{
-		{
-			Address: "bchreg:qzj7sr407etdfaletclgn7ut3nl3hxxqusfeje0vmf",
-			Amount:  500000,
-		},
-	}
-
-	tx, _ := m.CreateCoinTx(addrList, 10000, "")
-	log.Debug("tx hash", "tx hash", tx.TxHash().String())
-
-	pubKey1, _ := hex.DecodeString("049FD6230E3BADBBC7BA190E10B2FC5C3D8EA9B758A43E98AB2C8F83C826AE7EABEA6D88880BC606FA595CD8DD17FC7784B3E55D8EE0705045119545A803215B80")
-
-	pubKey2, _ := hex.DecodeString("044667E5B36F387C4D8D955C33FC271F46D791FD3433C0B2F517375BBD9AAE6B8C2392229537B109AC8EADCCE104AEAA64DB2D90BEF9008A09F8563CDB05FFB60B")
-
-	pubKey3, _ := hex.DecodeString("04A2E82BE35D90D954E15CC5865E2F8AC22FD2DDBD4750F4BFC7596363A3451D1B75F4A8BAD28CF48F63595349DBC141D6D6E21F4FEB65BDC5E1A8382A2775E787")
-
-	var sigsList [][][]byte
-	sigs1, _ := m.SignTx(tx, "E37B5BEBF46B6CAA4B2146CCD83D61966B33687A")
-	log.Debug("sigs1 verify", "verify result", m.VerifySign(tx, sigs1, pubKey1))
-
-	sigs2, _ := m.SignTx(tx, "BA3F9DF40CC2DD39D36A814865982110F84CAAD3")
-	log.Debug("sigs2 verify", "verify result", m.VerifySign(tx, sigs2, pubKey2))
-
-	sigs3, _ := m.SignTx(tx, "3722834BCB13F7308C28907B69A99DB462F39036")
-	log.Debug("sigs3 verify", "verify result", m.VerifySign(tx, sigs3, pubKey3))
-
-	sigsList = append(sigsList, sigs1)
-	sigsList = append(sigsList, sigs2)
-	sigsList = append(sigsList, sigs3)
-
-	m.MergeSignTx(tx, sigsList)
-	log.Debug("tx hash", "tx hash", tx.TxHash().String())
-
-	log.Debug("sigs:", "sig", hex.EncodeToString(tx.TxIn[0].SignatureScript))
-
-	hash, err := m.SendTx(tx)
-	if err != nil {
-		log.Debug("SendTx err", "err", err.Error())
-		return
-	}
-	log.Debug("Send Tx", "HASH", hash)
-
-}
-
 //GetTxByHash 通过交易hash从链上查询交易数据，查询提币交易通过签名前的交易HASH来查询（以保障各节点可独立验证，不依赖主节点发送的交易HASH）
 //查询抵押交易使用链上的交易HASH查询。
 func (m *MortgageWatcher) GetTxByHash(hash string) *Transaction {
-	key := strings.Join([]string{m.levelDbTxPreFix, hash}, "_")
+	key := strings.Join([]string{m.levelDbTxMappingPreFix, hash}, "_")
 
 	realHash, err := m.levelDb.Get([]byte(key))
 	if realHash != nil && err == nil {
@@ -778,27 +773,23 @@ func (m *MortgageWatcher) storeHashMapping(tx *wire.MsgTx) bool {
 		vin.SignatureScript = nil
 	}
 	hashBeforeSign := copyTx.TxHash().String()
-	key := strings.Join([]string{m.levelDbTxPreFix, hashBeforeSign}, "_")
+	mappingKey := strings.Join([]string{m.levelDbTxMappingPreFix, hashBeforeSign}, "_")
 	log.Debug("storeHashMap", "hash_before_sign", hashBeforeSign, "hash_after_sign", hashAfterSign, "coinType", m.coinType)
 
-	retErr := m.levelDb.Put([]byte(key), []byte(hashAfterSign))
+	retErr := m.levelDb.Put([]byte(mappingKey), []byte(hashAfterSign))
 	if retErr != nil {
-		log.Warn("Marshal utxo failed", "err", retErr.Error(), "coinType", m.coinType)
+		log.Warn("save hashmap failed", "err", retErr.Error(), "coinType", m.coinType)
+		return false
+	}
+
+	txKey := strings.Join([]string{m.levelDbTxPreFix, hashAfterSign}, "_")
+	retErr = m.levelDb.Put([]byte(txKey), []byte(hashAfterSign))
+	if retErr != nil {
+		log.Warn("save federation hash failed", "err", retErr.Error(), "coinType", m.coinType)
 		return false
 	}
 
 	return true
-
-}
-
-//GetUtxoInfoByID 通过ID查询utxo信息
-func (m *MortgageWatcher) GetUtxoInfoByID(utxoID string) *coinmanager.UtxoInfo {
-	t, ok := m.faUtxoInfo.Load(utxoID)
-	if ok {
-		utxoInfo := t.(*coinmanager.UtxoInfo)
-		return utxoInfo
-	}
-	return nil
 }
 
 func (m *MortgageWatcher) processConfirmBlock(blockData *coinmanager.BlockData) {
@@ -816,14 +807,9 @@ func (m *MortgageWatcher) processConfirmBlock(blockData *coinmanager.BlockData) 
 
 		for _, vin := range tx.TxIn {
 			utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-			t, ok := m.faUtxoInfo.Load(utxoID)
-			if ok {
-				utxoInfo := t.(*coinmanager.UtxoInfo)
-				utxoInfo.SpendType = 3
-				utxoInfo.VinTxid = tx.TxHash().String()
-				m.storeUtxo(utxoID)
+			utxoInfo := m.GetUtxoInfoByID(utxoID)
+			if utxoInfo != nil {
 				isFromFedAddr = true
-				m.faUtxoInfo.Delete(utxoID)
 			}
 
 		}
@@ -838,31 +824,8 @@ func (m *MortgageWatcher) processConfirmBlock(blockData *coinmanager.BlockData) 
 				if _, ok := m.federationMap.Load(address); ok {
 					isFedAddr = true
 					value = vout.Value
-
 					id := strings.Join([]string{txHash, strconv.Itoa(voutIndex)}, "_")
-
-					t, ok := m.faUtxoInfo.Load(id)
-					if !ok {
-						newUtxo := coinmanager.UtxoInfo{
-							Address:      address,
-							VoutTxid:     txHash,
-							VoutIndex:    uint32(voutIndex),
-							Value:        vout.Value,
-							VoutPkscript: hex.EncodeToString(vout.PkScript),
-							SpendType:    1,
-							BlockHeight:  blockData.BlockInfo.Height,
-						}
-						m.faUtxoInfo.Store(id, &newUtxo)
-					} else {
-						utxoInfo := t.(*coinmanager.UtxoInfo)
-						if utxoInfo.SpendType < 1 {
-							utxoInfo.SpendType = 1
-						}
-					}
-					m.storeUtxo(id)
-
 					log.Debug("FIND NEW UTXO", "id", id, "value", value, "coinType", m.coinType)
-
 				}
 			} else {
 				message, err = ParserPayLoadScript(vout.PkScript)
@@ -903,42 +866,9 @@ func (m *MortgageWatcher) processNewTx(newTx *wire.MsgTx) {
 
 	for _, vin := range newTx.TxIn {
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-		t, ok := m.faUtxoInfo.Load(utxoID)
-		if ok {
-			utxoInfo := t.(*coinmanager.UtxoInfo)
-			utxoInfo.SpendType = 2
-			utxoInfo.VinTxid = newTx.TxHash().String()
-			m.storeUtxo(utxoID)
+		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		if utxoInfo != nil {
 			isFromFedAddr = true
-		}
-	}
-
-	for voutIndex, vout := range newTx.TxOut {
-		address := coinmanager.ExtractPkScriptAddr(vout.PkScript, m.coinType)
-		if address != "" {
-			if _, ok := m.federationMap.Load(address); ok {
-
-				if isFromFedAddr {
-					spendType := 0
-
-					id := strings.Join([]string{txHash, strconv.Itoa(voutIndex)}, "_")
-					newUtxo := coinmanager.UtxoInfo{
-						Address:      address,
-						VoutTxid:     txHash,
-						VoutIndex:    uint32(voutIndex),
-						Value:        vout.Value,
-						VoutPkscript: hex.EncodeToString(vout.PkScript),
-						SpendType:    int32(spendType),
-					}
-
-					_, ok := m.faUtxoInfo.Load(id)
-					if !ok {
-						m.faUtxoInfo.Store(id, &newUtxo)
-						m.storeUtxo(id)
-					}
-				}
-
-			}
 		}
 	}
 
@@ -950,67 +880,15 @@ func (m *MortgageWatcher) processNewTx(newTx *wire.MsgTx) {
 
 func (m *MortgageWatcher) processNewUnconfirmBlock(blockData *coinmanager.BlockData) {
 	for _, tx := range blockData.MsgBolck.Transactions {
-		txHash := tx.TxHash().String()
-
-		//update utxo status
-		isFromFedAddr := false
-		for _, vin := range tx.TxIn {
-			utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
-			t, ok := m.faUtxoInfo.Load(utxoID)
-			if ok {
-				utxoInfo := t.(*coinmanager.UtxoInfo)
-				utxoInfo.SpendType = 2
-				utxoInfo.VinTxid = tx.TxHash().String()
-				m.storeUtxo(utxoID)
-				isFromFedAddr = true
-			}
-		}
-
-		for voutIndex, vout := range tx.TxOut {
-			address := coinmanager.ExtractPkScriptAddr(vout.PkScript, m.coinType)
-			if address != "" {
-				if _, ok := m.federationMap.Load(address); ok {
-					if isFromFedAddr {
-						spendType := 0
-
-						id := strings.Join([]string{txHash, strconv.Itoa(voutIndex)}, "_")
-						newUtxo := coinmanager.UtxoInfo{
-							Address:      address,
-							VoutTxid:     txHash,
-							VoutIndex:    uint32(voutIndex),
-							Value:        vout.Value,
-							VoutPkscript: hex.EncodeToString(vout.PkScript),
-							SpendType:    int32(spendType),
-							BlockHeight:  blockData.BlockInfo.Height,
-						}
-
-						t, ok := m.faUtxoInfo.Load(id)
-						if !ok {
-							m.faUtxoInfo.Store(id, &newUtxo)
-						} else {
-							utxoInfo := t.(*coinmanager.UtxoInfo)
-							utxoInfo.BlockHeight = blockData.BlockInfo.Height
-						}
-						m.storeUtxo(id)
-
-					}
-
-					//log.Debug("FIND NEW UTXO", "id", id, "value", newUtxo.Value, "coinType", m.coinType)
-
-				}
-			}
-		}
-
-		if isFromFedAddr {
-			m.storeHashMapping(tx)
-		}
+		m.processNewTx(tx)
 	}
 }
 
 //StartWatch 启动监听已确认和未确认的区块以及新交易，提取抵押交易
 func (m *MortgageWatcher) StartWatch() {
 	m.utxoMonitor()
-	m.bwClient.WatchConfirmBlock()
+	m.syncUtxoInfo()
+
 	m.bwClient.WatchNewTxFromNodeMempool()
 	m.bwClient.WatchNewBlock()
 
