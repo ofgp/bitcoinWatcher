@@ -9,6 +9,7 @@ import (
 )
 
 var defaultInterval = 1
+var freshBlockLength = 6
 
 func init() {
 	viper.SetDefault("BTC.confirm_block_num", 6)
@@ -86,39 +87,6 @@ func (bw *BitCoinWatcher) GetNewUnconfirmBlockChan() <-chan *BlockData {
 	return bw.newUnconfirmBlockChan
 }
 
-//WatchConfirmBlock 启动监听已确认区块
-func (bw *BitCoinWatcher) WatchConfirmBlock() {
-
-	go func() {
-
-		for {
-			blockHeight := bw.bitcoinClient.GetBlockCount()
-			if blockHeight-bw.scanConfirmHeight+1 < bw.confirmNeedNum {
-				time.Sleep(time.Duration(defaultInterval) * time.Second)
-				continue
-			}
-			for {
-				blockData := bw.bitcoinClient.GetBlockInfoByHeight(bw.scanConfirmHeight)
-				if blockData == nil {
-					break
-				}
-
-				isConfirm := bw.bitcoinClient.CheckIsConfirm(blockData)
-				if !isConfirm {
-					break
-				}
-				select {
-				case bw.confirmBlockChan <- blockData:
-					bw.scanConfirmHeight++
-				default:
-					time.Sleep(time.Duration(defaultInterval) * time.Second)
-				}
-			}
-		}
-	}()
-
-}
-
 //WatchNewTxFromNodeMempool 启动监听全节点内存中的新交易
 func (bw *BitCoinWatcher) WatchNewTxFromNodeMempool() {
 
@@ -155,60 +123,28 @@ func (bw *BitCoinWatcher) WatchNewTxFromNodeMempool() {
 
 //WatchNewBlock 启动监听新区块
 func (bw *BitCoinWatcher) WatchNewBlock() {
-
-	/*
-		go func() {
-			wg.Add(1)
-			defer func() {
-				wg.Done()
-			}()
-			for {
-				for {
-					blockhash, err := bw.zmqClient.RecvBytes(0)
-					if err != nil {
-						log.Error("zmq err", "err", err.Error())
-						break
-					}
-					log.Debug("get zmq hash", "hash", hex.EncodeToString(blockhash))
-					if len(blockhash) != 32 {
-						break
-					}
-					blockData := bw.bitcoinClient.GetBlockInfoByHash(hex.EncodeToString(blockhash))
-
-					if blockData == nil {
-						break
-					}
-					bw.newUnconfirmBlockChan <- blockData
-					bw.watchHeight = blockData.BlockInfo.Height
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}()
-	*/
-
 	go func() {
+		confirmIndex := 0
 
 		for {
 			blockHeight := bw.bitcoinClient.GetBlockCount()
-			//log.Debug("Check block count", "block_height", blockHeight)
+			log.Debug("Check block count", "block_height", blockHeight)
 
-			var watchHeight int64
+			var lastHeight int64
 			if bw.freshBlockList != nil {
-				watchHeight = bw.freshBlockList[len(bw.freshBlockList)-1].BlockInfo.Height
+				lastHeight = bw.freshBlockList[len(bw.freshBlockList)-1].BlockInfo.Height
 			} else {
-				watchHeight = blockHeight - 1
+				lastHeight = bw.scanConfirmHeight - 1
 			}
 
-			//log.Debug("watchHeight", "watchHeight", watchHeight)
-
-			if blockHeight <= watchHeight {
+			if blockHeight <= lastHeight {
 				time.Sleep(time.Duration(defaultInterval) * time.Second)
 				continue
 			}
 
 			for {
-				blockData := bw.bitcoinClient.GetBlockInfoByHeight(watchHeight + 1)
-				log.Debug("get block index", "index", watchHeight+1)
+				blockData := bw.bitcoinClient.GetBlockInfoByHeight(lastHeight + 1)
+				log.Debug("get block index", "index", lastHeight+1)
 
 				if blockData == nil {
 					break
@@ -219,39 +155,36 @@ func (bw *BitCoinWatcher) WatchNewBlock() {
 					if blockData.BlockInfo.PreviousHash != preHash {
 						log.Debug("hash not equal", "prehash", preHash, "newblockprehash", blockData.BlockInfo.PreviousHash)
 						bw.freshBlockList = bw.freshBlockList[:len(bw.freshBlockList)-1]
-						watchHeight--
+						if len(bw.freshBlockList) < confirmIndex {
+							confirmIndex--
+						}
+						lastHeight--
 						continue
 					}
 				}
 
 				bw.freshBlockList = append(bw.freshBlockList, blockData)
+				if len(bw.freshBlockList)-confirmIndex >= int(bw.confirmNeedNum) {
+					bw.confirmBlockChan <- bw.freshBlockList[confirmIndex]
+					confirmIndex++
+				}
 
 				if int(blockData.BlockInfo.Confirmations) < int(bw.confirmNeedNum) {
 					bw.newUnconfirmBlockChan <- blockData
 				}
 
-				watchHeight = bw.freshBlockList[len(bw.freshBlockList)-1].BlockInfo.Height
+				lastHeight = bw.freshBlockList[len(bw.freshBlockList)-1].BlockInfo.Height
 
-				if len(bw.freshBlockList) >= int(bw.confirmNeedNum) {
+				if len(bw.freshBlockList) >= freshBlockLength {
 					bw.freshBlockList = bw.freshBlockList[1:]
+					confirmIndex--
 				}
 				log.Debug("freshBlockList len", "len", len(bw.freshBlockList))
 
-				if watchHeight >= blockHeight {
+				if lastHeight >= blockHeight {
 					break
 				}
 			}
-			/*
-				for index := bw.watchHeight + 1; index <= blockHeight; index++ {
-					blockData := bw.bitcoinClient.GetBlockInfoByHeight(index)
-					log.Debug("get block index", "index", index)
-					if blockData == nil {
-						break
-					}
-					bw.newUnconfirmBlockChan <- blockData
-					bw.watchHeight = blockData.BlockInfo.Height
-				}
-			*/
 		}
 	}()
 

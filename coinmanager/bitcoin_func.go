@@ -312,28 +312,22 @@ func NewPrivateKey() ([]byte, []byte) {
 }
 
 //CoinSelect utxo coin选择算法
-func CoinSelect(utxoList []*UtxoInfo, targetValue int64, confirmHeight int64) ([]*UtxoInfo, int64) {
-	sorter := &UtxoSorter{
-		UtxoList:       utxoList,
-		MaxBlockHeight: confirmHeight,
-	}
-
+func CoinSelect(utxoList UtxoList, targetValue int64) (UtxoList, int64) {
 	//已确认的在前，未确认的在后
-	//确认数>6的在前，确认数=6的在后
 	//金额小的在前，大的在后
-	sort.Sort(sorter)
+	sort.Sort(utxoList)
 
-	var retCoin []*UtxoInfo
+	var retCoin UtxoList
 	var coinValueSum int64
 
-	var lowerCoin []*UtxoInfo
+	var lowerCoin UtxoList
 	var lowerSum int64
 
 	var coinLowestLarger *UtxoInfo
 	var coinLowestLargerValue int64 = -1
 
 	//优先挑金额与目标金额相等的utxo
-	for _, utxoInfo := range sorter.UtxoList {
+	for _, utxoInfo := range utxoList {
 		if utxoInfo.Value == targetValue {
 			retCoin = append(retCoin, utxoInfo)
 			coinValueSum += utxoInfo.Value
@@ -368,7 +362,7 @@ func CoinSelect(utxoList []*UtxoInfo, targetValue int64, confirmHeight int64) ([
 	i := 0
 	freshUtxoIndex := len(lowerCoin) - 1
 	for freshUtxoIndex >= 0 {
-		if lowerCoin[freshUtxoIndex].SpendType == 1 && confirmHeight-lowerCoin[freshUtxoIndex].BlockHeight > 0 {
+		if lowerCoin[freshUtxoIndex].Confirmations > 0 {
 			break
 		}
 		freshUtxoIndex--
@@ -407,65 +401,5 @@ func CoinSelect(utxoList []*UtxoInfo, targetValue int64, confirmHeight int64) ([
 	}
 
 	return retCoin, coinValueSum
-
-	/*
-		if lowerSum == targetValue {
-			return lowerCoin, lowerSum
-		}
-
-		if lowerSum < targetValue {
-			if coinLowestLargerValue == -1 {
-				return retCoin, coinValueSum
-			}
-
-			retCoin = append(retCoin, coinLowestLarger)
-			coinValueSum += coinLowestLarger.Value
-			return retCoin, coinValueSum
-		}
-
-		nBest := lowerSum
-		vBest := make([]int, len(lowerCoin))
-		for i := range vBest {
-			vBest[i] = 1
-		}
-
-		log.Debug("lowerCoin", "len", len(lowerCoin), "lowerSum", lowerSum)
-
-		for rep := 0; rep < 100 && nBest != targetValue; rep++ {
-			var nTotal int64
-			vInclude := make([]int, len(lowerCoin))
-
-			for id, utxoInfo := range lowerCoin {
-				rand.Seed(time.Now().UnixNano())
-				if rand.Intn(100)%2 == 0 {
-					nTotal += utxoInfo.Value
-					vInclude[id] = 1
-
-					if nTotal >= targetValue {
-						if nTotal <= nBest {
-							nBest = nTotal
-							copy(vBest, vInclude)
-							break
-						}
-						nTotal -= utxoInfo.Value
-						vInclude[id] = 0
-					}
-				}
-			}
-		}
-
-		if coinLowestLargerValue != -1 && coinLowestLargerValue-targetValue <= nBest-targetValue {
-			retCoin = append(retCoin, coinLowestLarger)
-			coinValueSum += coinLowestLarger.Value
-			return retCoin, coinValueSum
-		}
-
-		for id, utxoInfo := range lowerCoin {
-			if vBest[id] == 1 {
-				retCoin = append(retCoin, utxoInfo)
-			}
-		}
-		return retCoin, nBest
-	*/
 
 }
