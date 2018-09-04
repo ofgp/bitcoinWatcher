@@ -365,6 +365,8 @@ func (m *MortgageWatcher) TransferAsset(address string, sigNum int, NodeNum int)
 		utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
 		log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
 
+		m.utxoMonitorCount.Store(utxoID, 0)
+
 		vin := wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{
 				Hash:  *hash,
@@ -491,6 +493,7 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, Node
 
 				utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
 				log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
+				m.utxoMonitorCount.Store(utxoID, 0)
 
 				vin := wire.TxIn{
 					PreviousOutPoint: wire.OutPoint{
@@ -542,6 +545,7 @@ func (m *MortgageWatcher) SignTx(tx *wire.MsgTx, nodePubKeyHash string) ([][]byt
 	for i, vin := range tx.TxIn {
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
 		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		m.utxoMonitorCount.Store(utxoID, 0)
 
 		if utxoInfo != nil {
 			rs, rsok := m.federationMap.Load(utxoInfo.Address)
@@ -575,6 +579,7 @@ func (m *MortgageWatcher) MergeSignTx(tx *wire.MsgTx, sigsList [][][]byte) bool 
 	for i, vin := range tx.TxIn {
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
 		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		m.utxoMonitorCount.Store(utxoID, 0)
 		if utxoInfo == nil {
 			log.Warn("【MergeSignTx】CAN'T FIND UTXO", "utxo", utxoID)
 			return false
@@ -635,6 +640,7 @@ func (m *MortgageWatcher) VerifySign(tx *wire.MsgTx, sigs [][]byte, pubKey []byt
 
 		utxoID := strings.Join([]string{vin.PreviousOutPoint.Hash.String(), strconv.Itoa(int(vin.PreviousOutPoint.Index))}, "_")
 		utxoInfo := m.GetUtxoInfoByID(utxoID)
+		m.utxoMonitorCount.Store(utxoID, 0)
 		if utxoInfo != nil {
 			rs, rsok := m.federationMap.Load(utxoInfo.Address)
 			if !rsok {
