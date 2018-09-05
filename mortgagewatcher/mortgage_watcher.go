@@ -33,6 +33,7 @@ import (
 
 var (
 	confirmHeightLDKey = "confirmHeight"
+	syncInterval       = 2
 )
 
 func init() {
@@ -215,6 +216,7 @@ func (m *MortgageWatcher) syncUtxoInfo() {
 			utxoList, err := m.bwClient.GetBitCoinClient().ListUnspent(m.addrList)
 			if err != nil {
 				log.Warn("listunspent failed")
+				time.Sleep(time.Duration(syncInterval) * time.Second)
 				continue
 			}
 
@@ -250,7 +252,7 @@ func (m *MortgageWatcher) syncUtxoInfo() {
 				}
 			}
 			lastUtxoSnapShot = tempUtxo
-			time.Sleep(time.Duration(1) * time.Second)
+			time.Sleep(time.Duration(syncInterval) * time.Second)
 		}
 	}()
 }
