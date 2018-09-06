@@ -455,6 +455,9 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, Node
 		log.Error("get fee/kb failed", "err", err.Error())
 		return nil, 1
 	}
+
+	log.Debug("fee/kb", "fee", feePerKB)
+
 	if feePerKB <= 0 {
 		feePerKB = 1000
 	}

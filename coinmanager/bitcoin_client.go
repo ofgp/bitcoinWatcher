@@ -7,6 +7,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	log "github.com/inconshreveable/log15"
+	"github.com/shopspring/decimal"
 	"github.com/spf13/viper"
 )
 
@@ -191,7 +192,8 @@ func (b *BitCoinClient) EstimateFee(numBlocks int64) (int64, error) {
 		return 0, err
 	}
 
-	return int64(fee * 1E8), err
+	feePerKb := decimal.NewFromFloat(fee).Mul(decimal.NewFromFloat(1E8)).IntPart()
+	return feePerKb, err
 
 }
 
