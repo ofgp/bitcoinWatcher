@@ -386,7 +386,7 @@ func (m *MortgageWatcher) TransferAsset(address string, sigNum int, NodeNum int)
 
 	//估算fee值
 	bitcoinClient := m.bwClient.GetBitCoinClient()
-	feePerKB, err := bitcoinClient.EstimateFee(1)
+	feePerKB, err := bitcoinClient.EstimateFee(6)
 	if err != nil {
 		log.Error("get fee/kb failed", "err", err.Error())
 		return nil
@@ -450,7 +450,7 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, Node
 	}
 
 	//miner fee
-	feePerKB, err := m.bwClient.GetBitCoinClient().EstimateFee(1)
+	feePerKB, err := m.bwClient.GetBitCoinClient().EstimateFee(6)
 	if err != nil {
 		log.Error("get fee/kb failed", "err", err.Error())
 		return nil, 1
