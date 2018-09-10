@@ -346,7 +346,7 @@ func CoinSelect(utxoList UtxoList, targetValue int64) (UtxoList, int64) {
 		retCoin = append(retCoin, coinLowestLarger)
 		coinValueSum += coinLowestLarger.Value
 
-		if len(lowerCoin) > 0 && lowerCoin[0].Value > 0 && coinLowestLarger.Value/lowerCoin[0].Value >= 10 {
+		if len(lowerCoin) > 0 && lowerCoin[0].Value > 0 && lowerCoin[0].Confirmations > 0 && coinLowestLarger.Value/lowerCoin[0].Value >= 10 {
 			retCoin = append(retCoin, lowerCoin[0])
 			coinValueSum += lowerCoin[0].Value
 		}
