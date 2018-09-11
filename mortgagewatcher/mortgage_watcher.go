@@ -488,27 +488,6 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, Node
 		}
 
 		if coinSum >= totalValue+minFee {
-			//new vin
-			for _, selectCoin := range selectCoinList {
-				hash, err := chainhash.NewHashFromStr(selectCoin.Txid)
-				if err != nil {
-					log.Warn("NEW_HASH_FAILED:", "err", err.Error(), "hash", hash, "coinType", m.coinType)
-					return nil, 100
-				}
-
-				utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
-				log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
-				m.utxoMonitorCount.Store(utxoID, 0)
-
-				vin := wire.TxIn{
-					PreviousOutPoint: wire.OutPoint{
-						Hash:  *hash,
-						Index: selectCoin.Vout,
-					},
-				}
-				tx.AddTxIn(&vin)
-			}
-
 			//找零
 			if coinSum-totalValue-minFee > 546 {
 				smallChange := AddressInfo{
@@ -535,6 +514,27 @@ func (m *MortgageWatcher) CreateCoinTx(addrList []*AddressInfo, sigNum int, Node
 					PkScript: pkScript,
 				}
 				tx.AddTxOut(&vout)
+			}
+
+			//new vin
+			for _, selectCoin := range selectCoinList {
+				hash, err := chainhash.NewHashFromStr(selectCoin.Txid)
+				if err != nil {
+					log.Warn("NEW_HASH_FAILED:", "err", err.Error(), "hash", hash, "coinType", m.coinType)
+					return nil, 100
+				}
+
+				utxoID := strings.Join([]string{selectCoin.Txid, strconv.Itoa(int(selectCoin.Vout))}, "_")
+				log.Debug("select coin", "utxo_id", utxoID, "coinType", m.coinType)
+				m.utxoMonitorCount.Store(utxoID, 0)
+
+				vin := wire.TxIn{
+					PreviousOutPoint: wire.OutPoint{
+						Hash:  *hash,
+						Index: selectCoin.Vout,
+					},
+				}
+				tx.AddTxIn(&vin)
 			}
 
 			return tx, 0
