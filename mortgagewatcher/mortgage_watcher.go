@@ -153,6 +153,10 @@ func NewMortgageWatcher(coinType string, confirmHeight int64, federationAddress 
 		mw.loadMode = viper.GetString("BCH.load_mode")
 	}
 
+	mw.levelDbUtxoPreFix = strings.Join([]string{coinType, "utxo"}, "_")
+	mw.levelDbTxPreFix = strings.Join([]string{coinType, "fa_tx"}, "_")
+	mw.levelDbTxMappingPreFix = strings.Join([]string{coinType, "hash_mapping"}, "_")
+
 	mw.federationMap.Store(federationAddress, redeemScript)
 	addr, err := coinmanager.DecodeAddress(federationAddress, coinType)
 	if err != nil {
@@ -162,10 +166,6 @@ func NewMortgageWatcher(coinType string, confirmHeight int64, federationAddress 
 	mw.addrList = append(mw.addrList, addr)
 
 	mw.loadUtxo()
-
-	mw.levelDbUtxoPreFix = strings.Join([]string{coinType, "utxo"}, "_")
-	mw.levelDbTxPreFix = strings.Join([]string{coinType, "fa_tx"}, "_")
-	mw.levelDbTxMappingPreFix = strings.Join([]string{coinType, "hash_mapping"}, "_")
 
 	return &mw, err
 }
@@ -215,6 +215,7 @@ func (m *MortgageWatcher) storeUtxo(utxoID string) bool {
 	t, ok := m.faUtxoInfo.Load(utxoID)
 	if ok {
 		utxoInfo := t.(*coinmanager.UtxoInfo)
+		log.Debug("store utxo", "utxoID", utxoID, "utxo", utxoInfo)
 		data, err := json.Marshal(utxoInfo)
 		if err != nil {
 			log.Warn("Marshal utxo failed", "err", err.Error(), "coinType", m.coinType)
@@ -931,6 +932,7 @@ func (m *MortgageWatcher) checkUtxo(checkHeight int64) {
 
 	for _, utxoInfo := range checkList {
 		_, err := bitclient.GetRawTransactionVerbose(utxoInfo.Txid)
+		log.Debug("check utxo", "utxoID", utxoInfo.Txid)
 		if coinmanager.CheckTxIsMiss(err) {
 			//交易不存在了
 			utxoID := strings.Join([]string{utxoInfo.Txid, strconv.Itoa(int(utxoInfo.Vout))}, "_")
@@ -1000,6 +1002,7 @@ func (m *MortgageWatcher) loadUtxoFromLevelDb() {
 	for iter.Next() {
 		utxo := &coinmanager.UtxoInfo{}
 		err := json.Unmarshal(iter.Value(), utxo)
+		log.Debug("load utxo from leveldb", "key", string(iter.Key()), "utxo", utxo)
 		if err != nil {
 			log.Warn("Unmarshal UTXO FROM LEVELDB ERR", "err", err.Error(), "coinType", m.coinType)
 			continue
@@ -1008,6 +1011,7 @@ func (m *MortgageWatcher) loadUtxoFromLevelDb() {
 		if utxo.SpendType == 3 {
 			continue
 		}
+
 		m.faUtxoInfo.Store(string(iter.Key())[9:], utxo)
 
 	}
