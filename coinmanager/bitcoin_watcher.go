@@ -153,7 +153,7 @@ func (bw *BitCoinWatcher) WatchNewBlock() {
 				if len(bw.freshBlockList) > 0 {
 					preHash := bw.freshBlockList[len(bw.freshBlockList)-1].BlockInfo.Hash
 					if blockData.BlockInfo.PreviousHash != preHash {
-						log.Debug("hash not equal", "prehash", preHash, "newblockprehash", blockData.BlockInfo.PreviousHash)
+						log.Info("hash not equal", "prehash", preHash, "newblockprehash", blockData.BlockInfo.PreviousHash)
 						bw.freshBlockList = bw.freshBlockList[:len(bw.freshBlockList)-1]
 						if len(bw.freshBlockList) < confirmIndex {
 							confirmIndex--

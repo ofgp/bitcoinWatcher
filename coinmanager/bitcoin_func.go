@@ -12,6 +12,7 @@ import (
 	"github.com/ofgp/bitcoinWatcher/util"
 
 	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -402,4 +403,20 @@ func CoinSelect(utxoList UtxoList, targetValue int64) (UtxoList, int64) {
 
 	return retCoin, coinValueSum
 
+}
+
+func CheckTxIsMiss(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	e := btcjson.NewRPCError(0, "")
+	if reflect.TypeOf(err).String() == reflect.TypeOf(e).String() {
+		e.Code = err.(*btcjson.RPCError).Code
+		if e.Code == -5 {
+			return true
+		}
+	}
+
+	return false
 }
