@@ -27,19 +27,9 @@ type UtxoList []*UtxoInfo
 func (u UtxoList) Len() int      { return len(u) }
 func (u UtxoList) Swap(i, j int) { u[i], u[j] = u[j], u[i] }
 func (u UtxoList) Less(i, j int) bool {
-	priorityI := 0
-	priorityJ := 0
 
-	if u[i].Confirmations > 0 {
-		priorityI = 1
-	}
-
-	if u[j].Confirmations > 0 {
-		priorityJ = 1
-	}
-
-	if priorityI != priorityJ {
-		return priorityI > priorityJ
+	if u[i].SpendType != u[j].SpendType {
+		return u[i].SpendType > u[j].SpendType
 	}
 
 	return u[i].Value < u[j].Value
