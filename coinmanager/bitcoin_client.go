@@ -1,6 +1,8 @@
 package coinmanager
 
 import (
+	"encoding/json"
+
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/rpcclient"
@@ -22,6 +24,7 @@ func init() {
 type BitCoinClient struct {
 	rpcClient  *rpcclient.Client
 	confirmNum uint64
+	coinType   string
 }
 
 //NewBitCoinClient 创建一个bitcoin操作客户端
@@ -32,6 +35,7 @@ func NewBitCoinClient(coinType string) (*BitCoinClient, error) {
 	}
 	bc := &BitCoinClient{}
 
+	bc.coinType = coinType
 	switch coinType {
 	case "btc":
 		connCfg.Host = viper.GetString("BTC.rpc_server")
@@ -187,13 +191,45 @@ func (b *BitCoinClient) SendRawTransaction(tx *wire.MsgTx) (*chainhash.Hash, err
 
 //EstimateFee 评估交易矿工费
 func (b *BitCoinClient) EstimateFee(numBlocks int64) (int64, error) {
-	fee, err := b.rpcClient.EstimateFee(numBlocks)
-	if err != nil {
-		return 0, err
+
+	var fee float64
+
+	if b.coinType == "bch" {
+		res, err := b.rpcClient.EstimateFee(numBlocks)
+		if err != nil {
+			return 0, err
+		}
+
+		fee = res
+	} else {
+		cmd := NewEstimateSmartFeeCmd(numBlocks)
+
+		rawParams := make([]json.RawMessage, 0, 1)
+
+		marshalledParam, err := json.Marshal(cmd.NumBlocks)
+		if err != nil {
+			return -1, err
+		}
+		rawMessage := json.RawMessage(marshalledParam)
+		rawParams = append(rawParams, rawMessage)
+
+		res, err := b.rpcClient.RawRequest("estimatesmartfee", rawParams)
+		if err != nil {
+			return -1, err
+		}
+		log.Debug("res", "res", string(res))
+
+		var feeRes EstimateSmartFeeResult
+		err = json.Unmarshal(res, &feeRes)
+		if err != nil {
+			return -1, err
+		}
+
+		fee = feeRes.Feerate
 	}
 
 	feePerKb := decimal.NewFromFloat(fee).Mul(decimal.NewFromFloat(1E8)).IntPart()
-	return feePerKb, err
+	return feePerKb, nil
 
 }
 
